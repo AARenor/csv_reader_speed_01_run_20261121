@@ -32,22 +32,25 @@ whole-file `answersJson()`.
 
 Method: `node main.ts` per run on the practice set (`kit/practice/input/cases.json`, 6 cases, 10,193,953
 characters of CSV, 63,692 rows and 1,770 errors in the answers), fresh output directory, CPU time =
-`process.resourceUsage()` user + system of that process at exit, 9 runs each in a rotated order, median, on
-**Node 24.22.3** (written v24.22.3):
+`process.resourceUsage()` user + system of that process at exit, runs in a rotated order, median, the whole
+process pinned to **one CPU** with `taskset -c 0` to match the grader's 1 CPU container, on an otherwise idle
+machine. The same harness measures this entry and the house baseline in the same heat:
 
-| entry | median CPU | min | max |
+| runtime | this entry (median CPU) | csv-reader 1.0.0 baseline | speedup |
 |---|---|---|---|
-| csv-reader 1.0.0, the house baseline | 1607.4 ms | 1560.5 ms | 1692.1 ms |
-| this repository's previous commit (5dcc858) | 414.4 ms | 401.6 ms | 438.1 ms |
-| this entry | **198.7 ms** | 188.2 ms | 208.0 ms |
+| Node v22.23.5 (the runtime `RULES.txt` names for the graded runs) | **197.8 ms** (190.3 to 206.8) | 1129.9 ms (1082.1 to 1150.0) | **5.7x** |
+| Node v24.22.3 | 191.7 ms (185.2 to 197.9) | 1155.9 ms (1148.1 to 1174.3) | 6.0x |
+| Node v26.13.1 | 200.6 ms (193.6 to 209.2) | 1111.3 ms (1092.2 to 1137.8) | 5.5x |
 
-That is **8.1x faster than the house baseline** (8.5x in an earlier session on the same machine) and 2.1x faster
-than the previous commit, with every answer identical as a JSON value.
+Nine runs per entry per runtime on Node 22 and 26, five on Node 24. Every answer was identical to
+`kit/practice/reference/expected.json` on all 6 cases in every one of those runs.
 
-The grader runs node22, so the same measurement was repeated on **Node v22.23.5**, the whole run measured by the
-same harness: csv-reader 1659.6 ms median (1641.6 to 1727.4 across 9 runs), this entry 208.1 ms (200.1 to 217.5),
-**8.0x**, and every answer still identical to the reference. The same 6 cases were checked against
-`kit/practice/reference/expected.json`, and the reader was checked against the vendored csv-reader 1.0.0 on 60
+An earlier revision of this file quoted 8.1x and 8.0x. Those runs were made while the machine was building other
+jobs, which slowed the baseline to 1607 to 1660 ms; on an idle 1 CPU machine the baseline is about 1130 ms and the
+honest figure is 5.5x to 6.0x. The entry's own time barely moved (191 to 201 ms across runtimes), so the whole
+difference was the machine, not the reader.
+
+The reader was also checked for correctness beyond the practice set: against the vendored csv-reader 1.0.0 on 60
 more generated cases (the kit's own generator, 10 more draws) and on 9,200 random broken texts (embedded newlines,
 doubled quotes, CRLF, lone CRs, empty fields, trailing commas, BOMs, characters outside Latin-1, junk after a
 closing quote, quotes that never close): every answer identical.
