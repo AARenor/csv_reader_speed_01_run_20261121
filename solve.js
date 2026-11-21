@@ -85,6 +85,7 @@ let T_LINE = 0;
 let T_END = 0;
 /** What the record reader hands back besides: where the width-th field ended, and whether the line was blank. */
 let T_CUT = 0;
+let T_COUNT = 0;
 let T_BLANK = false;
 
 class NonCanonical extends Error {}
@@ -565,33 +566,130 @@ function endCase(k, firstOff, endOff) {
 }
 
 /**
+ * Plain fields from i (the current field's opening quote already written at o-1): four bytes a step as plainFn,
+ * but a comma does not stop it: it closes the field, writes "," and opens the next one, unless that one starts with
+ * a quote (T_END COMMA, the next field's opening quote written). Stops at a line break (BREAK), the end of the text
+ * (END) or of the window (MORE). Hands back in T_*, the field count and the width-th field's end in T_COUNT, T_CUT.
+ */
+function plainRun(s, d, i, o, line, n, count, width, cutO) {
+  const sv = SV;
+  const dv = DV;
+  for (;;) {
+    const w = sv.getInt32(i, true);
+    const a = w ^ 0x2c2c2c2c;
+    const b = w ^ 0x5c5c5c5c;
+    const q = w ^ 0x22222222;
+    const m = (((a - 0x01010101) & ~a) | ((b - 0x01010101) & ~b) | ((q - 0x01010101) & ~q)) & 0x80808080;
+    dv.setInt32(o, w, true);
+    if (m === 0) {
+      i += 4;
+      o += 4;
+      continue;
+    }
+    const k = (31 - Math.clz32(m & -m)) >> 3;
+    i += k;
+    o += k;
+    const c = s[i];
+    if (c === 44) {
+      d[o] = 34;
+      d[o + 1] = 44;
+      d[o + 2] = 34;
+      if (count === width) cutO = o + 1;
+      count += 1;
+      o += 3;
+      i += 1;
+      if (s[i] === 92 && s[i + 1] === 34) {
+        T_END = COMMA;
+        break;
+      }
+      continue;
+    }
+    if (c === 92) {
+      if (i + 6 > n) {
+        T_END = MORE;
+        return;
+      }
+      const e = s[i + 1];
+      if (e === 110) {
+        i += 2;
+        line += 1;
+        T_END = BREAK;
+        break;
+      }
+      if (e === 114) {
+        if (s[i + 2] === 92 && s[i + 3] === 110) {
+          i += 4;
+          line += 1;
+          T_END = BREAK;
+          break;
+        }
+        addErr(E_STRAY, 0, 0);
+        i += 2;
+        continue;
+      }
+      if (e === 117) {
+        o = copyU(s, d, i, o);
+        i += 6;
+        continue;
+      }
+      d[o++] = 92;
+      d[o++] = e;
+      i += 2;
+      continue;
+    }
+    // the raw quote: the end of the case's text, or the sentinel at the end of the window
+    T_END = i < n ? END : MORE;
+    break;
+  }
+  T_I = i;
+  T_O = o;
+  T_LINE = line;
+  T_COUNT = count;
+  T_CUT = cutO;
+}
+
+/**
  * The fields of one record from i, each written as "...", separated by commas, at o (the caller has written the
  * record's "["). Returns the count of fields, or -1 when the record runs past the window; hands back in T_*.
  */
 function recordFn(s, d, i, o, line, n, width) {
-  let count = 0;
+  let count = 1;
   let cutO = 0;
+  d[o++] = 34;
   for (;;) {
-    if (count > 0) d[o++] = 44;
-    d[o++] = 34;
     const vs = o;
-    const quoted = s[i] === 92 && s[i + 1] === 34 && i + 6 <= n;
-    if (quoted) quotedFn(s, d, i, o, line, n);
-    else plainFn(s, d, i, o, line, n);
+    if (s[i] === 92 && s[i + 1] === 34 && i + 6 <= n) {
+      quotedFn(s, d, i, o, line, n);
+      const ended = T_END;
+      if (ended === MORE) return -1;
+      i = T_I;
+      o = T_O;
+      line = T_LINE;
+      d[o++] = 34;
+      if (count === width) cutO = o;
+      if (ended !== COMMA) {
+        T_BLANK = false;
+        break;
+      }
+      d[o++] = 44;
+      d[o++] = 34;
+      count += 1;
+      continue;
+    }
+    plainRun(s, d, i, o, line, n, count, width, cutO);
     const ended = T_END;
     if (ended === MORE) return -1;
     i = T_I;
     o = T_O;
     line = T_LINE;
-    count += 1;
-    if (ended !== COMMA) {
-      T_BLANK = count === 1 && o === vs && !quoted;
-      d[o++] = 34;
-      if (count === width) cutO = o;
-      break;
-    }
+    count = T_COUNT;
+    cutO = T_CUT;
+    if (ended === COMMA) continue;
+    // A record that is one plain field with no characters left (only dropped CRs) is a blank line.
+    T_BLANK = count === 1 && o === vs;
     d[o++] = 34;
     if (count === width) cutO = o;
+    break;
   }
   T_I = i;
   T_O = o;
@@ -832,7 +930,7 @@ try {
 } catch {
   natives = null;
 }
-const HOT = [plainFn, quotedFn, recordFn, scanAll];
+const HOT = [plainRun, quotedFn, recordFn, scanAll];
 if (natives) for (const f of HOT) natives.prepare(f);
 try {
   const warm = [];
@@ -846,5 +944,5 @@ EC = 0;
 XO = 0;
 if (natives) {
   for (const f of HOT) natives.optimize(f);
-  for (const f of [cp, putInt, addErr, copyU, padShort, longRow, room, put]) natives.never(f);
+  for (const f of [plainFn, cp, putInt, addErr, copyU, padShort, longRow, room, put]) natives.never(f);
 }
