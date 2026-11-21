@@ -32,7 +32,8 @@ whole-file `answersJson()`.
 
 Method: `node main.ts` per run on the practice set (`kit/practice/input/cases.json`, 6 cases, 10,193,953
 characters of CSV, 63,692 rows and 1,770 errors in the answers), fresh output directory, CPU time =
-`process.resourceUsage()` user + system of that process at exit, 9 runs each in a rotated order, median:
+`process.resourceUsage()` user + system of that process at exit, 9 runs each in a rotated order, median, on
+**Node 24.22.3** (written v24.22.3):
 
 | entry | median CPU | min | max |
 |---|---|---|---|
@@ -41,7 +42,11 @@ characters of CSV, 63,692 rows and 1,770 errors in the answers), fresh output di
 | this entry | **198.7 ms** | 188.2 ms | 208.0 ms |
 
 That is **8.1x faster than the house baseline** (8.5x in an earlier session on the same machine) and 2.1x faster
-than the previous commit, with every answer identical as a JSON value. The same 6 cases were checked against
+than the previous commit, with every answer identical as a JSON value.
+
+The grader runs node22, so the same measurement was repeated on **Node v22.23.5**, the whole run measured by the
+same harness: csv-reader 1659.6 ms median (1641.6 to 1727.4 across 9 runs), this entry 208.1 ms (200.1 to 217.5),
+**8.0x**, and every answer still identical to the reference. The same 6 cases were checked against
 `kit/practice/reference/expected.json`, and the reader was checked against the vendored csv-reader 1.0.0 on 60
 more generated cases (the kit's own generator, 10 more draws) and on 9,200 random broken texts (embedded newlines,
 doubled quotes, CRLF, lone CRs, empty fields, trailing commas, BOMs, characters outside Latin-1, junk after a
