@@ -26,7 +26,9 @@ for everyone, so what is left is reading 11 MB, writing 12.5 MB, the scan itself
   with JSON whitespace) once the flag is known; errors are kept as numbers and written at the end of the case.
 - **Four bytes a step.** The field readers read the text as 32-bit words through a `DataView`, find the first
   comma, backslash or quote in a word with the zero-byte bit trick (the lowest flagged byte is always a real one),
-  and store the word as it is; a plain field runs on through commas in the same call.
+  and store the word as it is; a plain field runs on through commas in the same call. A comma costs one 32-bit
+  store — closing quote, comma and the next field's opening quote — and a 16-bit comparison, not three byte
+  stores and two comparisons.
 - **Compiled once, on purpose.** The scan is four small functions. `main.ts` sets V8 flags before importing
   `solve.js`: natives syntax, no inlining, no loop peeling, no concurrent OSR. A tiny warm-up walks every branch of
   the policy through a tiny window (refill, restart, growth and flush included), then the four readers are marked
@@ -35,6 +37,10 @@ for everyone, so what is left is reading 11 MB, writing 12.5 MB, the scan itself
   on the same CPU, and the helpers that run only a few thousand times (error writing, padding) are never compiled.
   Without the flag (`solve.js` imported on its own) the `new Function` that holds the natives call throws and V8
   tiers up by itself; the answers are the same either way.
+- **No ESM facade for a builtin.** An `import ... from 'node:fs'` builds the module's ESM facade at start-up, which
+  costs a few milliseconds of CPU on this Node, while `process.getBuiltinModule('node:fs')` costs almost nothing;
+  so `solve.js` takes `fs` from the builtin registry and builds its two paths itself. `main.ts` sets its flags
+  through V8's own binding (`process.binding('v8')`, its deprecation notice silenced), which loads nothing else.
 - **Any spelling of the input.** Anything that is not the plain `JSON.stringify` layout the harness writes (a
   `\uXXXX` escape that spells a quote, comma or line break, other keys, whitespace) is answered by the same reader
   after `JSON.parse` and a canonical re-spelling of each case.
@@ -48,28 +54,32 @@ user + system of the whole child process (all its threads) read by the parent wi
 `main.ts` that reads nothing and writes `[null,null,null,null,null,null]`) runs in every round, as the grader's
 control does; **net = median gross − median gross of the null entry**. Entries run in a rotated order in each round.
 
-Eleven rounds:
+Fifteen rounds, this commit against the one before it in the same session:
 
 | entry | median gross CPU | median net CPU | net vs. csv-reader |
 |---|---|---|---|
-| null entry | 71.0 ms | 0 | |
-| csv-reader 1.0.0 (house baseline) | 1164.1 ms | 1093.0 ms | 1x |
-| this entry before this pass (commit 35f1836) | 203.5 ms | 132.5 ms | 8.2x |
-| **this entry** | **140.2 ms** | **69.1 ms** | **15.8x** |
+| null entry | 74.9 ms | 0 | |
+| csv-reader 1.0.0 (house baseline) | 1201.5 ms | 1126.6 ms | 1x |
+| this entry before this pass (commit 715b482) | 143.2 ms | 68.2 ms | 16.5x |
+| **this entry** | **139.1 ms** | **64.1 ms** | **17.6x** |
 
-A second session of 15 rounds gave 204.1 / 132.7 ms (before) and 138.6 / 67.1 ms (this entry), gross / net.
-Every answer in every run was identical to `kit/practice/reference/expected.json`. These are this machine's
-numbers; the grader's sandbox is slower, so its figures are higher.
+That session ran on a shared machine; a quieter session of 21 rounds gave 137.7 / 64.4 ms (715b482) and
+136.1 / 62.8 ms (this entry), gross / net. Every answer in every run was identical to
+`kit/practice/reference/expected.json`. These are this machine's numbers; the grader's sandbox is slower, so its
+figures are higher.
 
-Where the net time goes (same machine): about 15 ms of V8 compiling the four readers (`--turbo-stats`), about
-30 ms of scanning, and 10 to 15 ms of system time (reading 11 MB, writing 12.5 MB, page faults).
+Where the net time goes (same machine, first run of a process): about 15 ms of V8 compiling the four readers
+(`--turbo-stats`), about 30 ms of scanning, about 12 ms of system time (reading 11 MB, writing 12.5 MB, page
+faults), and about 4 ms of loading `solve.js` and walking its warm-up.
 
 ## Checked against csv-reader 1.0.0
 
 - The practice set through the kit's own scorer, and `makefun grade-local --driver docker` (the grader's image):
   6 of 6 cases, "L1 regrade reproduced byte for byte".
-- 20 more sets drawn with the kit's own generator (120 cases; 10 of the 20 sets are fresh draws made for this
-  pass), answered by `main.ts` and checked with the kit's scorer against the vendored csv-reader 1.0.0: all pass.
+- 22 more sets drawn with the kit's own generator (132 cases; 12 of the sets are fresh draws made for this pass),
+  answered by `main.ts` and checked with the kit's scorer against the vendored csv-reader 1.0.0: every case passed.
+- 84,434 random broken texts in 8,500 `cases.json` files read for this pass, a fifth of them through `run()` as
+  well and 1,500 files with the flags `main.ts` sets, every answer identical to the vendored csv-reader 1.0.0's.
 - 103,414 random broken texts in 8,400 `cases.json` files read through windows of 64 bytes to 256 KB (so every
   refill, record restart, window growth and output flush runs), about 30% of the files re-spelled with random `\uXXXX`
   escapes of any character, `\/`, whitespace and swapped keys: BOMs, CRLF, lone CRs inside and outside quotes,

@@ -35,8 +35,11 @@
 //     comma or line break, other keys, whitespace) is answered by the same reader after JSON.parse and a
 //     canonical JSON.stringify of each case, so the answer never depends on how the input was spelled.
 
-import { closeSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
-import { join } from 'node:path';
+// node:fs straight from the builtin registry: an ESM `import ... from 'node:fs'` builds the module's ESM facade,
+// which costs some 4 ms of CPU at start-up, while process.getBuiltinModule costs almost nothing. The two paths are
+// built here rather than with node:path, which would be another import.
+const { closeSync, openSync, readFileSync, readSync, writeFileSync, writeSync } = process.getBuiltinModule('node:fs');
+const join = (dir, name) => dir + '/' + name;
 
 /** How a field ended: at a comma, at a line break, at the end of the text, or at the end of the window. */
 const COMMA = 0;
@@ -286,8 +289,9 @@ function plainFn(s, d, i, o, line, n) {
         i += 6;
         continue;
       }
-      d[o++] = 92;
-      d[o++] = e;
+      // Any other escape stands as it is (\t, \", \\, ...): two bytes, one 16-bit load and one 16-bit store.
+      dv.setUint16(o, sv.getUint16(i, true), true);
+      o += 2;
       i += 2;
       continue;
     }
@@ -330,8 +334,9 @@ function quotedFn(s, d, i, o, line, n) {
       const e = s[i + 1];
       if (e === 34) {
         if (s[i + 2] === 92 && s[i + 3] === 34) {
-          d[o++] = 92;
-          d[o++] = 34;
+          // a doubled quote inside the quoted field: the two bytes are already \" in JSON, one 16-bit store
+          dv.setUint16(o, 0x225c, true);
+          o += 2;
           i += 4;
           continue;
         }
@@ -339,15 +344,17 @@ function quotedFn(s, d, i, o, line, n) {
         break;
       }
       if (e === 110) {
-        d[o++] = 92;
-        d[o++] = 110;
+        // \n inside the quotes: the answer keeps it as \n, one 16-bit store
+        dv.setUint16(o, 0x6e5c, true);
+        o += 2;
         line += 1;
         i += 2;
         continue;
       }
       if (e === 114) {
-        d[o++] = 92;
-        d[o++] = 110;
+        // \r and \r\n inside the quotes both read as one line break and are written as \n
+        dv.setUint16(o, 0x6e5c, true);
+        o += 2;
         line += 1;
         i += s[i + 2] === 92 && s[i + 3] === 110 ? 4 : 2;
         continue;
@@ -357,8 +364,9 @@ function quotedFn(s, d, i, o, line, n) {
         i += 6;
         continue;
       }
-      d[o++] = 92;
-      d[o++] = e;
+      // An escape inside a quoted field stays escaped (\n, \r read as a line break, and the answer keeps \n).
+      dv.setUint16(o, sv.getUint16(i, true), true);
+      o += 2;
       i += 2;
       continue;
     }
@@ -596,14 +604,14 @@ function plainRun(s, d, i, o, line, n, count, width, cutO) {
     o += k;
     const c = s[i];
     if (c === 44) {
-      d[o] = 34;
-      d[o + 1] = 44;
-      d[o + 2] = 34;
       if (count === width) cutO = o + 1;
       count += 1;
+      // Closing quote, comma and the next field's opening quote in one 32-bit store; its fourth byte is the next
+      // field's first character, or is written again by whatever comes next.
+      dv.setInt32(o, 0x222c22, true);
       o += 3;
       i += 1;
-      if (s[i] === 92 && s[i + 1] === 34) {
+      if (sv.getUint16(i, true) === 0x225c) {
         T_END = COMMA;
         break;
       }
