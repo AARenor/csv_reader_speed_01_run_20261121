@@ -800,8 +800,13 @@ export function run(input) {
 }
 
 // One tiny text per branch of the policy, read through a tiny window so the refill, the record restart and the
-// window growth run too. V8 compiles the hot loop for the branches it has seen; walking each one first keeps the
+// window growth run too. V8 compiles the readers for the branches it has seen; walking each one first keeps the
 // real input from meeting a branch the compiled code never planned for.
+//
+// When main.ts has turned on V8's natives syntax, the readers are then compiled once, at their first call on the
+// real input, synchronously and from the warm-up's feedback (%OptimizeFunctionOnNextCall): no on-stack replacement,
+// no background compile racing a scan that runs slow code meanwhile on the one CPU, and the helpers that run only a
+// few thousand times are never compiled at all. Without the flag `new Function` throws and V8 tiers up on its own.
 const WARM_TEXTS = [
   '\uFEFFa,b,c\r\n1,2,3\r\n',
   '"x,y","a""b","c\r\nd"\r\n',
@@ -817,6 +822,18 @@ const WARM_TEXTS = [
   '\r\r\r\n,\n""\n',
   'a\tb,\u0001,\\,\uD800,"q\u0002"\n' + 'long field '.repeat(12) + ',x\n',
 ];
+let natives = null;
+try {
+  natives = {
+    prepare: new Function('f', '%PrepareFunctionForOptimization(f)'),
+    optimize: new Function('f', '%OptimizeFunctionOnNextCall(f)'),
+    never: new Function('f', '%NeverOptimizeFunction(f)'),
+  };
+} catch {
+  natives = null;
+}
+const HOT = [plainFn, quotedFn, recordFn, scanAll];
+if (natives) for (const f of HOT) natives.prepare(f);
 try {
   const warm = [];
   for (let i = 0; i < WARM_TEXTS.length; i++) warm.push({ id: 'g', input: { text: WARM_TEXTS[i], header: i % 2 === 0 } });
@@ -827,3 +844,7 @@ try {
 }
 EC = 0;
 XO = 0;
+if (natives) {
+  for (const f of HOT) natives.optimize(f);
+  for (const f of [cp, putInt, addErr, copyU, padShort, longRow, room, put]) natives.never(f);
+}
