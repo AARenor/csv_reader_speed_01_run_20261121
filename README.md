@@ -63,8 +63,8 @@ Fifteen rounds, this commit against the one before it in the same session:
 | this entry before this pass (commit 715b482) | 143.2 ms | 68.2 ms | 16.5x |
 | **this entry** | **139.1 ms** | **64.1 ms** | **17.6x** |
 
-That session ran on a shared machine; a quieter session of 21 rounds gave 137.7 / 64.4 ms (715b482) and
-136.1 / 62.8 ms (this entry), gross / net. Every answer in every run was identical to
+Two more sessions of 21 rounds on the same machine: 137.7 / 64.4 ms against 136.1 / 62.8 ms, and 139.5 / 67.9 ms
+against 133.9 / 62.4 ms (715b482 first, this entry second, gross / net). Every answer in every run was identical to
 `kit/practice/reference/expected.json`. These are this machine's numbers; the grader's sandbox is slower, so its
 figures are higher.
 
