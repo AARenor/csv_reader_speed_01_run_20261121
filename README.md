@@ -48,21 +48,21 @@ user + system of the whole child process (all its threads) read by the parent wi
 `main.ts` that reads nothing and writes `[null,null,null,null,null,null]`) runs in every round, as the grader's
 control does; **net = median gross − median gross of the null entry**. Entries run in a rotated order in each round.
 
-Nine rounds:
+Eleven rounds:
 
 | entry | median gross CPU | median net CPU | net vs. csv-reader |
 |---|---|---|---|
-| null entry | 71.1 ms | 0 | |
-| csv-reader 1.0.0 (house baseline) | 1163.0 ms | 1091.9 ms | 1x |
-| this entry before this pass (commit 35f1836) | 202.9 ms | 131.8 ms | 8.3x |
-| **this entry** | **142.3 ms** | **71.2 ms** | **15.3x** |
+| null entry | 71.0 ms | 0 | |
+| csv-reader 1.0.0 (house baseline) | 1164.1 ms | 1093.0 ms | 1x |
+| this entry before this pass (commit 35f1836) | 203.5 ms | 132.5 ms | 8.2x |
+| **this entry** | **140.2 ms** | **69.1 ms** | **15.8x** |
 
-A second session of 15 rounds gave 202.2 / 130.7 ms (before) and 142.5 / 71.0 ms (this entry), gross / net.
+A second session of 15 rounds gave 204.1 / 132.7 ms (before) and 138.6 / 67.1 ms (this entry), gross / net.
 Every answer in every run was identical to `kit/practice/reference/expected.json`. These are this machine's
 numbers; the grader's sandbox is slower, so its figures are higher.
 
-Where the net time goes (same machine): about 16 ms of V8 compiling the four readers, about 30 ms of scanning,
-and 10 to 15 ms of system time (reading 11 MB, writing 12.5 MB, page faults).
+Where the net time goes (same machine): about 15 ms of V8 compiling the four readers (`--turbo-stats`), about
+30 ms of scanning, and 10 to 15 ms of system time (reading 11 MB, writing 12.5 MB, page faults).
 
 ## Checked against csv-reader 1.0.0
 
@@ -70,7 +70,7 @@ and 10 to 15 ms of system time (reading 11 MB, writing 12.5 MB, page faults).
   6 of 6 cases, "L1 regrade reproduced byte for byte".
 - 20 more sets drawn with the kit's own generator (120 cases; 10 of the 20 sets are fresh draws made for this
   pass), answered by `main.ts` and checked with the kit's scorer against the vendored csv-reader 1.0.0: all pass.
-- 104,076 random broken texts in 8,400 `cases.json` files read through windows of 64 bytes to 256 KB (so every
+- 103,414 random broken texts in 8,400 `cases.json` files read through windows of 64 bytes to 256 KB (so every
   refill, record restart, window growth and output flush runs), about 30% of the files re-spelled with random `\uXXXX`
   escapes of any character, `\/`, whitespace and swapped keys: BOMs, CRLF, lone CRs inside and outside quotes,
   doubled quotes, junk after a closing quote, quotes that never close, blank lines, short and long rows, header true

@@ -26,8 +26,11 @@
 //   - The header flag comes after the text in cases.json, so the first record is written between two reserved
 //     gaps of fixed size, filled at the end of the case (padded with JSON whitespace) once the flag is known;
 //     errors are kept as numbers and written at the end of the case too.
-//   - One scan function walks the whole file, so V8 compiles its hot loop once; the rare paths are small
-//     functions of their own, and a tiny warm-up walks every branch before the real input.
+//   - Four bytes a step: the field readers read 32-bit words through a DataView and find the first comma,
+//     backslash or quote of a word with the zero-byte bit trick, storing each word as it is read.
+//   - Four small hot functions (scanCase, recordFn, plainRun, quotedFn); the rare paths are functions of their own.
+//     A tiny warm-up walks every branch first, and with natives syntax on (main.ts) the four are then compiled
+//     once each, synchronously, from the warm-up's feedback, and the rare helpers never (see the warm-up below).
 //   - Anything that is not the plain JSON.stringify layout the harness writes (a \u escape that spells a quote,
 //     comma or line break, other keys, whitespace) is answered by the same reader after JSON.parse and a
 //     canonical JSON.stringify of each case, so the answer never depends on how the input was spelled.
@@ -416,12 +419,6 @@ function padShort(count, width, o) {
   return o;
 }
 
-/** Copy b[from, to) to t at `at`, byte by byte: the pieces are short, and a native copy per piece costs more. */
-function cp(b, from, to, t, at) {
-  while (from < to) t[at++] = b[from++];
-  return at;
-}
-
 /** A long row's extra fields, already written at d[from, to), kept for its error record. */
 function longRow(d, from, to) {
   const len = to - from;
@@ -430,7 +427,7 @@ function longRow(d, from, to) {
     XB.copy(t, 0, 0, XO);
     XB = t;
   }
-  cp(d, from, to, XB, XO);
+  XB.set(d.subarray(from, to), XO);
   addErr(E_LONG, XO, XO + len);
   XO += len;
 }
@@ -446,7 +443,8 @@ function match(s, i, key) {
 
 function put(o, b) {
   o = room(o, b.length);
-  return cp(b, 0, b.length, D, o);
+  D.set(b, o);
+  return o + b.length;
 }
 
 function putInt(o, v) {
@@ -541,18 +539,25 @@ function endCase(k, firstOff, endOff) {
     const d = D;
     if (x > 0) d[o++] = 44;
     const head = CODE_HEAD[code];
-    o = cp(head, 0, head.length, d, o);
+    d.set(head, o);
+    o += head.length;
     o = putInt(o, EI[x + 1]);
-    o = cp(ROW_KEY, 0, ROW_KEY.length, d, o);
+    d.set(ROW_KEY, o);
+    o += ROW_KEY.length;
     const rk = EI[x + 2];
-    if (header && rk === 0) o = cp(NULL, 0, 4, d, o);
-    else o = putInt(o, header ? rk - 1 : rk);
+    if (header && rk === 0) {
+      d.set(NULL, o);
+      o += 4;
+    } else o = putInt(o, header ? rk - 1 : rk);
     if (code === E_SHORT) {
-      o = cp(FIELDS_KEY, 0, FIELDS_KEY.length, d, o);
+      d.set(FIELDS_KEY, o);
+      o += FIELDS_KEY.length;
       o = putInt(o, EI[x + 3]);
     } else if (code === E_LONG) {
-      o = cp(EXTRA_KEY, 0, EXTRA_KEY.length, d, o);
-      o = cp(XB, EI[x + 3], EI[x + 4], d, o);
+      d.set(EXTRA_KEY, o);
+      o += EXTRA_KEY.length;
+      d.set(XB.subarray(EI[x + 3], EI[x + 4]), o);
+      o += extra;
       d[o++] = 93;
     }
     d[o++] = 125;
@@ -708,17 +713,51 @@ function scanAll() {
   for (;;) {
     if (!beginCase(first)) break;
     first = false;
-    let s = S;
-    let d = D;
-    let n = N;
-    let i = I;
-    let o = O;
-    let line = 1;
-    let k = 0;
-    let width = -1;
-    let firstOff = -1;
-    let endOff = -1;
-    for (;;) {
+    const k = scanCase();
+    endCase(k, T_FIRST, T_SUFFIX);
+  }
+}
+
+/** Where the first record's two reserved gaps are, as file offsets (scanCase hands them to endCase). */
+let T_FIRST = -1;
+let T_SUFFIX = -1;
+
+/**
+ * The records of one case's text from I, written at O; leaves I at the text's closing quote and returns the count
+ * of records written (the header included).
+ */
+function scanCase() {
+  let s = S;
+  let d = D;
+  let n = N;
+  let i = I;
+  let o = O;
+  let line = 1;
+  let k = 0;
+  let width = -1;
+  let firstOff = -1;
+  let endOff = -1;
+  for (;;) {
+    if (n - i < LOW && !EOF) {
+      O = o;
+      refill(i, false);
+      s = S;
+      d = D;
+      n = N;
+      i = 0;
+    }
+    if (o > FLUSH_AT) {
+      o = flushOut(o);
+      d = D;
+    }
+    // Lines with no characters are no records: skip LF and CRLF.
+    let c = s[i];
+    while (c === 92) {
+      const e = s[i + 1];
+      if (e === 110) i += 2;
+      else if (e === 114 && s[i + 2] === 92 && s[i + 3] === 110) i += 4;
+      else break;
+      line += 1;
       if (n - i < LOW && !EOF) {
         O = o;
         refill(i, false);
@@ -727,89 +766,70 @@ function scanAll() {
         n = N;
         i = 0;
       }
-      if (o > FLUSH_AT) {
-        o = flushOut(o);
-        d = D;
-      }
-      // Lines with no characters are no records: skip LF and CRLF.
-      let c = s[i];
-      while (c === 92) {
-        const e = s[i + 1];
-        if (e === 110) i += 2;
-        else if (e === 114 && s[i + 2] === 92 && s[i + 3] === 110) i += 4;
-        else break;
-        line += 1;
-        if (n - i < LOW && !EOF) {
-          O = o;
-          refill(i, false);
-          s = S;
-          d = D;
-          n = N;
-          i = 0;
-        }
-        c = s[i];
-      }
-      if (c === 34) {
-        if (i >= n) throw new NonCanonical();
-        break;
-      }
-      const recI = i;
-      const recO = o;
-      const recEC = EC;
-      const recXO = XO;
-      const recLine = line;
-      RL = line;
-      RK = k;
-      if (k === 0) o += 24;
-      else if (k > 1) d[o++] = 44;
-      d[o++] = 91;
-      const count = recordFn(s, d, i, o, line, n, width);
-      if (count < 0) {
-        // The record runs past the window: read it again from its start after a refill (or a larger window).
-        if (EOF) throw new NonCanonical();
-        o = recO;
-        EC = recEC;
-        XO = recXO;
-        line = recLine;
-        O = o;
-        refill(recI, recI === 0);
-        s = S;
-        d = D;
-        n = N;
-        i = 0;
-        continue;
-      }
-      i = T_I;
-      o = T_O;
-      line = T_LINE;
-      const cutO = T_CUT;
-      // A line left with no characters (only dropped CRs) is no record; its errors stay.
-      if (T_BLANK) {
-        o = recO;
-        continue;
-      }
-      if (width < 0) width = count;
-      if (k > 0) {
-        if (count < width) {
-          o = padShort(count, width, o);
-          d = D;
-        } else if (count > width) {
-          longRow(d, cutO + 1, o);
-          o = cutO;
-        }
-      }
-      d[o++] = 93;
-      if (k === 0) {
-        firstOff = FLUSHED + recO;
-        endOff = FLUSHED + o;
-        o += 9;
-      }
-      k += 1;
+      c = s[i];
     }
-    I = i;
-    O = o;
-    endCase(k, firstOff, endOff);
+    if (c === 34) {
+      if (i >= n) throw new NonCanonical();
+      break;
+    }
+    const recI = i;
+    const recO = o;
+    const recEC = EC;
+    const recXO = XO;
+    const recLine = line;
+    RL = line;
+    RK = k;
+    if (k === 0) o += 24;
+    else if (k > 1) d[o++] = 44;
+    d[o++] = 91;
+    const count = recordFn(s, d, i, o, line, n, width);
+    if (count < 0) {
+      // The record runs past the window: read it again from its start after a refill (or a larger window).
+      if (EOF) throw new NonCanonical();
+      o = recO;
+      EC = recEC;
+      XO = recXO;
+      line = recLine;
+      O = o;
+      refill(recI, recI === 0);
+      s = S;
+      d = D;
+      n = N;
+      i = 0;
+      continue;
+    }
+    i = T_I;
+    o = T_O;
+    line = T_LINE;
+    const cutO = T_CUT;
+    // A line left with no characters (only dropped CRs) is no record; its errors stay.
+    if (T_BLANK) {
+      o = recO;
+      continue;
+    }
+    if (width < 0) width = count;
+    if (k > 0) {
+      if (count < width) {
+        o = padShort(count, width, o);
+        d = D;
+      } else if (count > width) {
+        longRow(d, cutO + 1, o);
+        o = cutO;
+      }
+    }
+    d[o++] = 93;
+    if (k === 0) {
+      firstOff = FLUSHED + recO;
+      endOff = FLUSHED + o;
+      o += 9;
+    }
+    k += 1;
   }
+  I = i;
+  O = o;
+  T_FIRST = firstOff;
+  T_SUFFIX = endOff;
+  return k;
 }
 
 /** Reset the reader for one source (a file descriptor or a buffer) and one sink (a file descriptor or memory). */
@@ -930,7 +950,7 @@ try {
 } catch {
   natives = null;
 }
-const HOT = [plainRun, quotedFn, recordFn, scanAll];
+const HOT = [plainRun, quotedFn, recordFn, scanCase];
 if (natives) for (const f of HOT) natives.prepare(f);
 try {
   const warm = [];
@@ -944,5 +964,5 @@ EC = 0;
 XO = 0;
 if (natives) {
   for (const f of HOT) natives.optimize(f);
-  for (const f of [plainFn, cp, putInt, addErr, copyU, padShort, longRow, room, put]) natives.never(f);
+  for (const f of [plainFn, putInt, addErr, copyU, padShort, longRow, room, put, endCase, scanAll]) natives.never(f);
 }
