@@ -36,16 +36,16 @@ characters of CSV, 63,692 rows and 1,770 errors in the answers), fresh output di
 
 | entry | median CPU | min | max |
 |---|---|---|---|
-| csv-reader 1.0.0, the house baseline | 1686.0 ms | 1502.6 ms | 1812.3 ms |
-| this repository's previous commit (5dcc858) | 440.7 ms | 400.2 ms | 488.9 ms |
-| this entry | **197.9 ms** | 191.3 ms | 225.1 ms |
+| csv-reader 1.0.0, the house baseline | 1607.4 ms | 1560.5 ms | 1692.1 ms |
+| this repository's previous commit (5dcc858) | 414.4 ms | 401.6 ms | 438.1 ms |
+| this entry | **198.7 ms** | 188.2 ms | 208.0 ms |
 
-That is **8.5x faster than the house baseline** and 2.2x faster than the previous commit, with every answer
-identical as a JSON value. The same 6 cases were checked against `kit/practice/reference/expected.json`, and the
-reader was checked against the vendored csv-reader 1.0.0 on 36 more generated cases (the kit's own generator,
-6 more draws) and on 6,200 random broken texts (embedded newlines, doubled quotes, CRLF, lone CRs, empty fields,
-trailing commas, BOMs, characters outside Latin-1, junk after a closing quote, quotes that never close): every
-answer identical.
+That is **8.1x faster than the house baseline** (8.5x in an earlier session on the same machine) and 2.1x faster
+than the previous commit, with every answer identical as a JSON value. The same 6 cases were checked against
+`kit/practice/reference/expected.json`, and the reader was checked against the vendored csv-reader 1.0.0 on 60
+more generated cases (the kit's own generator, 10 more draws) and on 9,200 random broken texts (embedded newlines,
+doubled quotes, CRLF, lone CRs, empty fields, trailing commas, BOMs, characters outside Latin-1, junk after a
+closing quote, quotes that never close): every answer identical.
 
 ## Run it
 

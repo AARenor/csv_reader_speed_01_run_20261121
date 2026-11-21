@@ -272,8 +272,18 @@ function emitCase(src, textStart, textEnd, header) {
   let i = textStart;
   let line = 1;
 
-  // A U+FEFF at the very start is dropped.
+  // A U+FEFF at the very start is dropped: raw, as JSON.stringify writes it, or as the \ufeff escape.
   if (i + 2 < textEnd && src[i] === 0xef && src[i + 1] === 0xbb && src[i + 2] === 0xbf) i += 3;
+  else if (
+    i + 5 < textEnd &&
+    src[i] === BS &&
+    src[i + 1] === C_U &&
+    (src[i + 2] | 0x20) === 0x66 &&
+    (src[i + 3] | 0x20) === 0x65 &&
+    (src[i + 4] | 0x20) === 0x66 &&
+    (src[i + 5] | 0x20) === 0x66
+  )
+    i += 6;
 
   o += d.write('{"columns":', o, 'latin1');
 
