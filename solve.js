@@ -1,8 +1,8 @@
 // solve.js: a faster drop-in for csv-reader 1.0.0.
 //
 // run(input) returns csv-reader 1.0.0's answer for one case's input {text, header}: the JSON value
-// {columns, rows, errors}. The reading policy is csv-reader's, to the letter (the reference's comments are the
-// specification):
+// {columns, rows, errors}. main(inputDir, outputDir) answers the harness's whole cases.json into answers.json.
+// The reading policy is csv-reader's, to the letter:
 //   - a U+FEFF at the very start is dropped;
 //   - a record ends at LF or CRLF, and a line left with no characters is no record;
 //   - outside quotes a CR not followed by LF is dropped, error stray_cr;
@@ -16,433 +16,792 @@
 //   - each error is {code, line, row}, line the 1-based line its record starts on and row its index in rows
 //     (null for the header), pushed in the order met.
 //
-// Why it is fast. The harness hands the entry /input/cases.json and takes /output/answers.json, so no JavaScript
-// string is ever needed: the file is read as bytes and the JSON-escaped bytes of each case's text are scanned
-// where they sit. JSON escapes exactly the characters a CSV reader cares about (a quote is \" and a line break
-// is \n or \r), and a run of escaped bytes is already the exact JSON text of the value it spells, so every field
-// is copied from the input to the output without being decoded, and no object, array or string is built for the
-// answers. The whole file is answered in one pass and written with one write. `run()` is the same reader over a
-// single case, kept for the entry's contract.
-//
-// Each field reader is a small function of its own, and the rare branches (a stray CR to drop, a doubled quote, a
-// line break inside quotes, junk after a closing quote, a quote that never closes) sit on their own paths, so V8
-// compiles and keeps the hot loops that meet hundreds of thousands of fields without paying for the rest. A tiny
-// warm-up at module load walks every branch once before the real cases, so none of them pays for a
-// deoptimisation in the middle of its scan.
-//
-// Field readers hand the position, the line and how the field ended back in the module's scratch, which every
-// call overwrites before it is read; the reader keeps nothing from one call to the next.
+// Why it is fast.
+//   - No string is ever built. cases.json is read as bytes and each case's text is scanned where it sits, still
+//     JSON-escaped: JSON escapes exactly the characters a CSV reader cares about (a quote is \" and a line break
+//     \n or \r), and a run of escaped bytes is already the JSON text of the value it spells, so every field is
+//     copied from input bytes to output bytes.
+//   - Little fresh memory. The input is read through one reused 256 KB window and the answers are written from one
+//     reused output buffer, flushed between records, so the process never touches megabytes of new pages.
+//   - The header flag comes after the text in cases.json, so the first record is written between two reserved
+//     gaps of fixed size, filled at the end of the case (padded with JSON whitespace) once the flag is known;
+//     errors are kept as numbers and written at the end of the case too.
+//   - One scan function walks the whole file, so V8 compiles its hot loop once; the rare paths are small
+//     functions of their own, and a tiny warm-up walks every branch before the real input.
+//   - Anything that is not the plain JSON.stringify layout the harness writes (a \u escape that spells a quote,
+//     comma or line break, other keys, whitespace) is answered by the same reader after JSON.parse and a
+//     canonical JSON.stringify of each case, so the answer never depends on how the input was spelled.
 
-/** A field's end: at a comma, at a line break, or at the end of the text. */
+import { closeSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
+
+/** How a field ended: at a comma, at a line break, at the end of the text, or at the end of the window. */
 const COMMA = 0;
-const LINE_BREAK = 1;
+const BREAK = 1;
 const END = 2;
+const MORE = 3;
 
-/** Bytes, so the scan compares numbers and never builds a one-character string. */
-const BS = 0x5c; // \
-const DQ = 0x22; // "
-const C_COMMA = 0x2c; // ,
-const C_LF = 0x6e; // the n of \n
-const C_CR = 0x72; // the r of \r
-const C_U = 0x75; // the u of \uXXXX
-const C_LBRACKET = 0x5b; // [
-const C_RBRACKET = 0x5d; // ]
-const C_RBRACE = 0x7d; // }
-const C_T = 0x74; // the t of true
+/** Error codes, in the numeric error records. */
+const E_STRAY = 0;
+const E_JUNK = 1;
+const E_UNTERM = 2;
+const E_SHORT = 3;
+const E_LONG = 4;
 
-/** The bytes that open a case's text and close it before its header: fixed by the harness's cases.json. */
-const TEXT_KEY = Buffer.from('"text":"', 'latin1');
-const HEADER_KEY = Buffer.from('","header":', 'latin1');
+const WINDOW = 1 << 18;
+const FLUSH = 3 << 16;
 
-/** The output buffer and its cursor, the errors buffer and its cursor. */
-let DST = null;
+/** The input window: S[0, N) holds data and S[N] is a raw quote, the sentinel. I is the read cursor. */
+let S = null;
+let N = 0;
+let I = 0;
+let EOF = false;
+let SRC_FD = -1;
+let SRC_MEM = null;
+let SRC_POS = 0;
+/** At a record's start at least LOW bytes are in the window unless the source is spent. */
+let LOW = 16384;
+
+/** The output buffer, its cursor, the bytes already written to OUT_FD, and when to flush. */
+let D = null;
 let O = 0;
-let ERR = Buffer.allocUnsafe(1 << 20);
-let EO = 0;
+let FLUSHED = 0;
+let OUT_FD = -1;
+let FLUSH_AT = 0;
 
-/** Where the last field reader left off: the position, the line, the output cursor and how the field ended. */
+/** The case's errors: 5 ints each (code, line, record index, a, b), and the bytes of long rows' extras. */
+let EI = new Int32Array(4096);
+let EC = 0;
+let XB = Buffer.allocUnsafe(1 << 16);
+let XO = 0;
+/** The current record's line and index, for the errors it records. */
+let RL = 0;
+let RK = 0;
+
+/** What the field readers hand back. */
 let T_I = 0;
-let T_LINE = 0;
 let T_O = 0;
-let T_ENDED = 0;
+let T_LINE = 0;
+let T_END = 0;
+/** What the record reader hands back besides: where the width-th field ended, and whether the line was blank. */
+let T_CUT = 0;
+let T_BLANK = false;
 
-/** Grow the errors buffer so that `need` more bytes fit. */
-function growErr(need) {
-  let cap = ERR.length;
-  while (cap < EO + need) cap *= 2;
-  const next = Buffer.allocUnsafe(cap);
-  ERR.copy(next, 0, 0, EO);
-  ERR = next;
+class NonCanonical extends Error {}
+
+const bytes = (s) => Buffer.from(s, 'latin1');
+const HEADER_KEY = bytes('","header":');
+const ID_KEY = bytes('{"id":"');
+const TEXT_KEY = bytes('","input":{"text":"');
+const PRE_H = bytes('{"columns":             ');
+const PRE_N = bytes('{"columns":null,"rows":[');
+const SUF_H = bytes(',"rows":[');
+const SUF_N2 = bytes(',        ');
+const SUF_N1 = bytes('         ');
+const EMPTY_H = bytes('{"columns":[],"rows":[');
+const EMPTY_N = bytes('{"columns":null,"rows":[');
+const ERRORS_KEY = bytes('],"errors":[');
+const CODE_HEAD = ['stray_cr', 'quote_junk', 'unterminated_quote', 'short_row', 'long_row'].map((c) =>
+  bytes('{"code":"' + c + '","line":'),
+);
+const ROW_KEY = bytes(',"row":');
+const NULL = bytes('null');
+const FIELDS_KEY = bytes(',"fields":');
+const EXTRA_KEY = bytes(',"extra":[');
+
+/** The window and the output buffer, with a DataView on each for the 4-byte steps of the field readers. */
+let SV = null;
+let DV = null;
+function setS(t) {
+  S = t;
+  SV = new DataView(t.buffer, t.byteOffset, t.length);
+}
+function setD(t) {
+  D = t;
+  DV = new DataView(t.buffer, t.byteOffset, t.length);
 }
 
-/** One error without payload: {code, line, row}, row null for the header. */
-function pushErr(code, line, row) {
-  const s = (EO > 0 ? ',' : '') + '{"code":"' + code + '","line":' + line + ',"row":' + (row < 0 ? 'null' : row) + '}';
-  if (EO + s.length > ERR.length) growErr(s.length);
-  EO += ERR.write(s, EO, 'latin1');
+/** Refill the window keeping S[keep, N) (moved to the front), doubling it first when `grow`. */
+function refill(keep, grow) {
+  let s = S;
+  const rest = N - keep;
+  if (grow) {
+    const t = Buffer.allocUnsafe(s.length * 2);
+    s.copy(t, 0, keep, N);
+    setS(t);
+    s = t;
+    fitOut(O);
+  } else if (keep > 0 && rest > 0) s.copyWithin(0, keep, N);
+  let n = rest;
+  // 8 bytes past the data stay free: the sentinel, and the field readers' 4-byte reads past it.
+  const cap = s.length - 8;
+  while (n < cap && !EOF) {
+    let got;
+    if (SRC_FD >= 0) got = readSync(SRC_FD, s, n, cap - n, null);
+    else {
+      got = Math.min(cap - n, SRC_MEM.length - SRC_POS);
+      SRC_MEM.copy(s, n, SRC_POS, SRC_POS + got);
+      SRC_POS += got;
+    }
+    if (got === 0) EOF = true;
+    else n += got;
+  }
+  N = n;
+  s[n] = 34;
+  I = 0;
 }
 
-/** A long_row's error, whose extra fields are already written in the output at [from, to). */
-function pushLongErr(line, row, out, from, to) {
-  const head = (EO > 0 ? ',' : '') + '{"code":"long_row","line":' + line + ',"row":' + (row < 0 ? 'null' : row) + ',"extra":[';
-  const need = head.length + (to - from) + 3;
-  if (EO + need > ERR.length) growErr(need);
-  EO += ERR.write(head, EO, 'latin1');
-  out.copy(ERR, EO, from, to);
-  EO += to - from;
-  EO += ERR.write(']}', EO, 'latin1');
+/** Keep the output buffer large enough for any record the window can hold past FLUSH_AT. */
+function fitOut(o) {
+  const need = FLUSH_AT + 3 * S.length + 4096;
+  if (D.length < need) {
+    const t = Buffer.allocUnsafe(need);
+    D.copy(t, 0, 0, o);
+    setD(t);
+  }
+}
+
+function writeAll(b, from, to) {
+  while (from < to) from += writeSync(OUT_FD, b, from, to - from);
+}
+
+/** Past FLUSH_AT: write the buffer out (file) or let it grow (memory). Returns the new cursor. */
+function flushOut(o) {
+  if (OUT_FD >= 0) {
+    writeAll(D, 0, o);
+    FLUSHED += o;
+    return 0;
+  }
+  FLUSH_AT *= 2;
+  fitOut(o);
+  return o;
+}
+
+/** Room for `need` more bytes at `o`. Returns the cursor (0 after a flush). */
+function room(o, need) {
+  if (o + need > D.length) {
+    if (o > 0) o = flushOut(o);
+    if (o + need > D.length) {
+      const t = Buffer.allocUnsafe(o + need + 4096);
+      D.copy(t, 0, 0, o);
+      setD(t);
+    }
+  }
+  return o;
+}
+
+function addErr(code, a, b) {
+  if (EC + 5 > EI.length) {
+    const t = new Int32Array(EI.length * 2);
+    t.set(EI);
+    EI = t;
+  }
+  EI[EC] = code;
+  EI[EC + 1] = RL;
+  EI[EC + 2] = RK;
+  EI[EC + 3] = a;
+  EI[EC + 4] = b;
+  EC += 5;
+}
+
+const hex = (c) => (c >= 48 && c <= 57 ? c - 48 : (c | 32) >= 97 && (c | 32) <= 102 ? (c | 32) - 87 : -1);
+
+/** A \uXXXX escape at i, copied as it stands; one that spells a character the reader cares about is no plain input. */
+function copyU(s, d, i, o) {
+  const a = hex(s[i + 2]);
+  const b = hex(s[i + 3]);
+  const c = hex(s[i + 4]);
+  const e = hex(s[i + 5]);
+  if ((a | b | c | e) < 0) throw new NonCanonical();
+  const v = (a << 12) | (b << 8) | (c << 4) | e;
+  if (v === 0x22 || v === 0x2c || v === 0x0a || v === 0x0d) throw new NonCanonical();
+  d[o] = 92;
+  d[o + 1] = 117;
+  d[o + 2] = s[i + 2];
+  d[o + 3] = s[i + 3];
+  d[o + 4] = s[i + 4];
+  d[o + 5] = s[i + 5];
+  return o + 6;
 }
 
 /**
- * An unquoted field (or the tail of one, or the junk after a closing quote) starting at `i`, written to `out` at
- * `o`: it ends at a comma, at a line break or at the end of the text, and a CR not followed by LF is dropped
- * (stray_cr). Leaves i, line, the output cursor and the ending in T_I, T_LINE, T_O and T_ENDED.
+ * An unquoted field (or its tail, or the junk after a closing quote) at i, written at o. Hands back in T_*.
+ * Four bytes a step: each word is stored as it is read, and a word holding a comma, a backslash or a raw quote
+ * (found with the zero-byte bit trick on the word XOR each of them; the lowest flagged byte is always a real one)
+ * stops the step at that byte; the bytes stored past it are overwritten by what comes next.
  */
-function plainInto(src, i, line, out, o, recLine, recRow) {
-  let ended = END;
+function plainFn(s, d, i, o, line, n) {
+  const sv = SV;
+  const dv = DV;
   for (;;) {
-    const c = src[i];
-    if (c === C_COMMA) {
-      i += 1;
-      ended = COMMA;
+    const w = sv.getInt32(i, true);
+    const a = w ^ 0x2c2c2c2c;
+    const b = w ^ 0x5c5c5c5c;
+    const q = w ^ 0x22222222;
+    const m = (((a - 0x01010101) & ~a) | ((b - 0x01010101) & ~b) | ((q - 0x01010101) & ~q)) & 0x80808080;
+    dv.setInt32(o, w, true);
+    if (m === 0) {
+      i += 4;
+      o += 4;
+      continue;
+    }
+    const k = (31 - Math.clz32(m & -m)) >> 3;
+    i += k;
+    o += k;
+    const c = s[i];
+    if (c === 44) {
+      T_I = i + 1;
+      T_END = COMMA;
       break;
     }
-    if (c === BS) {
-      const e = src[i + 1];
-      if (e === C_LF) {
-        i += 2;
+    if (c === 92) {
+      if (i + 6 > n) {
+        T_END = MORE;
+        return;
+      }
+      const e = s[i + 1];
+      if (e === 110) {
+        T_I = i + 2;
         line += 1;
-        ended = LINE_BREAK;
+        T_END = BREAK;
         break;
       }
-      if (e === C_CR) {
-        if (src[i + 2] === BS && src[i + 3] === C_LF) {
-          i += 4;
+      if (e === 114) {
+        if (s[i + 2] === 92 && s[i + 3] === 110) {
+          T_I = i + 4;
           line += 1;
-          ended = LINE_BREAK;
+          T_END = BREAK;
           break;
         }
-        pushErr('stray_cr', recLine, recRow);
+        addErr(E_STRAY, 0, 0);
         i += 2;
         continue;
       }
-      if (e === C_U) {
-        out[o++] = BS;
-        out[o++] = C_U;
-        out[o++] = src[i + 2];
-        out[o++] = src[i + 3];
-        out[o++] = src[i + 4];
-        out[o++] = src[i + 5];
+      if (e === 117) {
+        o = copyU(s, d, i, o);
         i += 6;
         continue;
       }
-      out[o++] = BS;
-      out[o++] = e;
+      d[o++] = 92;
+      d[o++] = e;
       i += 2;
       continue;
     }
-    if (c === DQ) break; // the raw quote that ends the case's text
-    out[o++] = c;
-    i += 1;
+    // the raw quote: the end of the case's text, or the sentinel at the end of the window
+    T_I = i;
+    T_END = i < n ? END : MORE;
+    break;
   }
-  T_I = i;
-  T_LINE = line;
   T_O = o;
-  T_ENDED = ended;
-  return ended;
+  T_LINE = line;
 }
 
-/**
- * A field that opens with a quote at `i`, written to `out` at `o`: "" inside it is one quote, a CRLF or a lone
- * CR inside it is one LF, and what follows its closing quote is appended as it stands. A quote that never closes
- * is a literal character and the text after it is read again, unquoted. Ends like plainInto, in T_*.
- */
-function quotedInto(src, i, line, textEnd, out, o, recLine, recRow) {
+/** A field that opens with a quote (\") at i, written at o. Hands back in T_*. Four bytes a step, as plainFn. */
+function quotedFn(s, d, i, o, line, n) {
+  const sv = SV;
+  const dv = DV;
   const openI = i;
   const openLine = line;
-  const valStart = o;
+  const vs = o;
   i += 2;
-  let closed = false;
   for (;;) {
-    const c = src[i];
-    if (c === BS) {
-      const e = src[i + 1];
-      if (e === DQ) {
-        if (src[i + 2] === BS && src[i + 3] === DQ) {
-          // "" inside a quoted field is one quote
-          out[o++] = BS;
-          out[o++] = DQ;
+    const w = sv.getInt32(i, true);
+    const b = w ^ 0x5c5c5c5c;
+    const q = w ^ 0x22222222;
+    const m = (((b - 0x01010101) & ~b) | ((q - 0x01010101) & ~q)) & 0x80808080;
+    dv.setInt32(o, w, true);
+    if (m === 0) {
+      i += 4;
+      o += 4;
+      continue;
+    }
+    const k = (31 - Math.clz32(m & -m)) >> 3;
+    i += k;
+    o += k;
+    if (s[i] === 92) {
+      if (i + 6 > n) {
+        T_END = MORE;
+        return;
+      }
+      const e = s[i + 1];
+      if (e === 34) {
+        if (s[i + 2] === 92 && s[i + 3] === 34) {
+          d[o++] = 92;
+          d[o++] = 34;
           i += 4;
           continue;
         }
         i += 2;
-        closed = true;
         break;
       }
-      if (e === C_LF) {
-        // a line break inside quotes is one LF
-        out[o++] = BS;
-        out[o++] = C_LF;
+      if (e === 110) {
+        d[o++] = 92;
+        d[o++] = 110;
         line += 1;
         i += 2;
         continue;
       }
-      if (e === C_CR) {
-        // CRLF and a lone CR inside quotes are each one LF
-        out[o++] = BS;
-        out[o++] = C_LF;
+      if (e === 114) {
+        d[o++] = 92;
+        d[o++] = 110;
         line += 1;
-        if (src[i + 2] === BS && src[i + 3] === C_LF) i += 4;
-        else i += 2;
+        i += s[i + 2] === 92 && s[i + 3] === 110 ? 4 : 2;
         continue;
       }
-      if (e === C_U) {
-        out[o++] = BS;
-        out[o++] = C_U;
-        out[o++] = src[i + 2];
-        out[o++] = src[i + 3];
-        out[o++] = src[i + 4];
-        out[o++] = src[i + 5];
+      if (e === 117) {
+        o = copyU(s, d, i, o);
         i += 6;
         continue;
       }
-      out[o++] = BS;
-      out[o++] = e;
+      d[o++] = 92;
+      d[o++] = e;
       i += 2;
       continue;
     }
-    if (c === DQ) break; // the raw quote that ends the case's text: the quote never closed
-    out[o++] = c;
-    i += 1;
-  }
-  if (!closed) {
-    // The quote never closes: it is a literal character and the text after it is read again, unquoted.
-    pushErr('unterminated_quote', recLine, recRow);
-    o = valStart;
-    out[o++] = BS;
-    out[o++] = DQ;
-    plainInto(src, openI + 2, openLine, out, o, recLine, recRow);
-    return;
-  }
-  if (i >= textEnd) {
-    T_ENDED = END;
-  } else {
-    const c2 = src[i];
-    if (c2 === C_COMMA) {
-      i += 1;
-      T_ENDED = COMMA;
-    } else if (c2 === BS && src[i + 1] === C_LF) {
-      i += 2;
-      line += 1;
-      T_ENDED = LINE_BREAK;
-    } else if (c2 === BS && src[i + 1] === C_CR && src[i + 2] === BS && src[i + 3] === C_LF) {
-      i += 4;
-      line += 1;
-      T_ENDED = LINE_BREAK;
-    } else {
-      // What follows the closing quote is appended as it stands (quote_junk when any was added).
-      const before = o;
-      plainInto(src, i, line, out, o, recLine, recRow);
-      if (T_O > before) pushErr('quote_junk', recLine, recRow);
+    // a raw quote
+    if (i >= n) {
+      T_END = MORE;
       return;
     }
+    // The quote never closes: a literal character, and the text after it is read again, unquoted.
+    addErr(E_UNTERM, 0, 0);
+    o = vs;
+    d[o++] = 92;
+    d[o++] = 34;
+    plainFn(s, d, openI + 2, o, openLine, n);
+    return;
   }
-  T_I = i;
-  T_LINE = line;
+  const c = s[i];
+  if (c === 44) {
+    T_I = i + 1;
+    T_END = COMMA;
+  } else if (c === 34) {
+    T_I = i;
+    T_END = END;
+  } else if (c === 92 && s[i + 1] === 110) {
+    T_I = i + 2;
+    line += 1;
+    T_END = BREAK;
+  } else if (c === 92 && s[i + 1] === 114 && s[i + 2] === 92 && s[i + 3] === 110) {
+    T_I = i + 4;
+    line += 1;
+    T_END = BREAK;
+  } else {
+    // What follows the closing quote is appended as it stands (quote_junk when any was added).
+    plainFn(s, d, i, o, line, n);
+    if (T_END !== MORE && T_O > o) addErr(E_JUNK, 0, 0);
+    return;
+  }
   T_O = o;
+  T_LINE = line;
 }
 
-/** Grow the output buffer so that `need` more bytes fit. */
-function growOut(need) {
-  let cap = DST.length;
-  while (cap < O + need) cap *= 2;
-  const next = Buffer.allocUnsafe(cap);
-  DST.copy(next, 0, 0, O);
-  DST = next;
-  return next;
+/** A short row's padding, at the record's end. */
+function padShort(count, width, o) {
+  addErr(E_SHORT, count, 0);
+  const need = 3 * (width - count) + 16;
+  if (o + need > D.length) {
+    const t = Buffer.allocUnsafe(o + need + 3 * S.length + 4096);
+    D.copy(t, 0, 0, o);
+    setD(t);
+  }
+  const d = D;
+  while (count < width) {
+    d[o++] = 44;
+    d[o++] = 34;
+    d[o++] = 34;
+    count += 1;
+  }
+  return o;
+}
+
+/** Copy b[from, to) to t at `at`, byte by byte: the pieces are short, and a native copy per piece costs more. */
+function cp(b, from, to, t, at) {
+  while (from < to) t[at++] = b[from++];
+  return at;
+}
+
+/** A long row's extra fields, already written at d[from, to), kept for its error record. */
+function longRow(d, from, to) {
+  const len = to - from;
+  if (XO + len > XB.length) {
+    const t = Buffer.allocUnsafe((XO + len) * 2);
+    XB.copy(t, 0, 0, XO);
+    XB = t;
+  }
+  cp(d, from, to, XB, XO);
+  addErr(E_LONG, XO, XO + len);
+  XO += len;
+}
+
+function ensure(m) {
+  if (N - I < m && !EOF) refill(I, false);
+}
+
+function match(s, i, key) {
+  for (let j = 0; j < key.length; j++) if (s[i + j] !== key[j]) return false;
+  return true;
+}
+
+function put(o, b) {
+  o = room(o, b.length);
+  return cp(b, 0, b.length, D, o);
+}
+
+function putInt(o, v) {
+  const d = D;
+  if (v < 0) throw new NonCanonical();
+  let len = 1;
+  for (let t = v; t >= 10; t = (t / 10) | 0) len += 1;
+  for (let j = len - 1; j >= 0; j--) {
+    d[o + j] = 48 + (v % 10);
+    v = (v / 10) | 0;
+  }
+  return o + len;
+}
+
+/** Fill a reserved gap at file offset `off` (still in the buffer, or already written out). */
+function patch(off, b) {
+  if (off >= FLUSHED) b.copy(D, off - FLUSHED);
+  else {
+    let done = 0;
+    while (done < b.length) done += writeSync(OUT_FD, b, done, b.length - done, off + done);
+  }
 }
 
 /**
- * One case, from the first byte of its text at `textStart` to the raw quote at `textEnd`, appended to the
- * output buffer: {"columns":...,"rows":[...],"errors":[...]}. Reads and writes bytes only.
+ * Before a case: the separator or the closing bracket, then {"id":"...","input":{"text":" and the BOM. Leaves I at
+ * the text's first character; false at the end of the array.
  */
-function emitCase(src, textStart, textEnd, header) {
-  let d = DST;
-  let o = O;
-  let i = textStart;
-  let line = 1;
-
-  // A U+FEFF at the very start is dropped: raw, as JSON.stringify writes it, or as the \ufeff escape.
-  if (i + 2 < textEnd && src[i] === 0xef && src[i + 1] === 0xbb && src[i + 2] === 0xbf) i += 3;
+function beginCase(first) {
+  ensure(4096);
+  const s = S;
+  let i = I;
+  if (s[i] === 93 && i < N) {
+    O = put(O, bytes(']'));
+    I = i + 1;
+    return false;
+  }
+  if (!first) {
+    if (s[i] !== 44) throw new NonCanonical();
+    i += 1;
+    O = put(O, bytes(','));
+  }
+  if (!match(s, i, ID_KEY)) throw new NonCanonical();
+  i += ID_KEY.length;
+  while (s[i] !== 34) {
+    if (s[i] === 92 || i >= N) throw new NonCanonical();
+    i += 1;
+  }
+  if (!match(s, i, TEXT_KEY)) throw new NonCanonical();
+  i += TEXT_KEY.length;
+  if (s[i] === 0xef && s[i + 1] === 0xbb && s[i + 2] === 0xbf) i += 3;
   else if (
-    i + 5 < textEnd &&
-    src[i] === BS &&
-    src[i + 1] === C_U &&
-    (src[i + 2] | 0x20) === 0x66 &&
-    (src[i + 3] | 0x20) === 0x65 &&
-    (src[i + 4] | 0x20) === 0x66 &&
-    (src[i + 5] | 0x20) === 0x66
+    s[i] === 92 &&
+    s[i + 1] === 117 &&
+    (s[i + 2] | 32) === 102 &&
+    (s[i + 3] | 32) === 101 &&
+    (s[i + 4] | 32) === 102 &&
+    (s[i + 5] | 32) === 102
   )
     i += 6;
+  if (i > N) throw new NonCanonical();
+  I = i;
+  return true;
+}
 
-  o += d.write('{"columns":', o, 'latin1');
-
-  let mode = header ? 0 : 1; // 0: the first accepted record is the columns, 1: rows
-  let width = -1;
-  let rowCount = 0;
-  let columnsDone = false;
-  let anyRow = false;
-  let ended = COMMA;
-
-  if (!header) o += d.write('null,"rows":[', o, 'latin1');
-
-  records: for (;;) {
-    // Lines with no characters are no records: skip LF and CRLF only.
-    for (;;) {
-      if (i >= textEnd) break records;
-      const c0 = src[i];
-      if (c0 === BS) {
-        const e0 = src[i + 1];
-        if (e0 === C_LF) {
-          i += 2;
-          line += 1;
-          continue;
-        }
-        if (e0 === C_CR && src[i + 2] === BS && src[i + 3] === C_LF) {
-          i += 4;
-          line += 1;
-          continue;
-        }
-      }
-      break;
+/** After a case's text (I at its closing quote): read the header flag, fill the gaps, write the errors. */
+function endCase(k, firstOff, endOff) {
+  ensure(64);
+  const s = S;
+  let i = I;
+  if (!match(s, i, HEADER_KEY)) throw new NonCanonical();
+  i += HEADER_KEY.length;
+  let header;
+  if (s[i] === 116 && s[i + 1] === 114 && s[i + 2] === 117 && s[i + 3] === 101) {
+    header = true;
+    i += 4;
+  } else if (s[i] === 102 && s[i + 1] === 97 && s[i + 2] === 108 && s[i + 3] === 115 && s[i + 4] === 101) {
+    header = false;
+    i += 5;
+  } else throw new NonCanonical();
+  if (s[i] !== 125 || s[i + 1] !== 125 || i + 2 > N) throw new NonCanonical();
+  I = i + 2;
+  let o = O;
+  if (k > 0) {
+    patch(firstOff, header ? PRE_H : PRE_N);
+    patch(endOff, header ? SUF_H : k > 1 ? SUF_N2 : SUF_N1);
+  } else o = put(o, header ? EMPTY_H : EMPTY_N);
+  o = put(o, ERRORS_KEY);
+  for (let x = 0; x < EC; x += 5) {
+    const code = EI[x];
+    const extra = code === E_LONG ? EI[x + 4] - EI[x + 3] : 0;
+    o = room(o, 128 + extra);
+    const d = D;
+    if (x > 0) d[o++] = 44;
+    const head = CODE_HEAD[code];
+    o = cp(head, 0, head.length, d, o);
+    o = putInt(o, EI[x + 1]);
+    o = cp(ROW_KEY, 0, ROW_KEY.length, d, o);
+    const rk = EI[x + 2];
+    if (header && rk === 0) o = cp(NULL, 0, 4, d, o);
+    else o = putInt(o, header ? rk - 1 : rk);
+    if (code === E_SHORT) {
+      o = cp(FIELDS_KEY, 0, FIELDS_KEY.length, d, o);
+      o = putInt(o, EI[x + 3]);
+    } else if (code === E_LONG) {
+      o = cp(EXTRA_KEY, 0, EXTRA_KEY.length, d, o);
+      o = cp(XB, EI[x + 3], EI[x + 4], d, o);
+      d[o++] = 93;
     }
-
-    const recLine = line;
-    const recRow = header && !columnsDone ? -1 : rowCount;
-    const recStart = o;
-    if (mode === 1 && anyRow) d[o++] = C_COMMA;
-    d[o++] = C_LBRACKET;
-
-    let count = 0;
-    let cutPos = 0;
-    let lastQuoted = false;
-    let lastEmpty = false;
-
-    for (;;) {
-      if (count > 0) d[o++] = C_COMMA;
-      d[o++] = DQ;
-      const valStart = o;
-      if (src[i] === BS && src[i + 1] === DQ) {
-        lastQuoted = true;
-        quotedInto(src, i, line, textEnd, d, o, recLine, recRow);
-      } else {
-        lastQuoted = false;
-        plainInto(src, i, line, d, o, recLine, recRow);
-      }
-      i = T_I;
-      line = T_LINE;
-      o = T_O;
-      ended = T_ENDED;
-      lastEmpty = o === valStart;
-      d[o++] = DQ;
-      count += 1;
-      if (count === width) cutPos = o;
-      if (ended !== COMMA) break;
-    }
-
-    // A line left with no characters (only dropped CRs) is no record; its errors stay.
-    if (count === 1 && lastEmpty && !lastQuoted) {
-      o = recStart;
-      continue;
-    }
-
-    if (width < 0) width = count;
-
-    if (mode === 0) {
-      columnsDone = true;
-      mode = 1;
-      d[o++] = C_RBRACKET;
-      o += d.write(',"rows":[', o, 'latin1');
-      continue;
-    }
-
-    if (count < width) {
-      pushErr('short_row', recLine, recRow);
-      ERR[EO - 1] = C_COMMA; // reopen the object for the payload
-      const payload = '"fields":' + count + '}';
-      if (EO + payload.length > ERR.length) growErr(payload.length);
-      EO += ERR.write(payload, EO, 'latin1');
-      if (o + 3 * (width - count) + 2 > d.length) {
-        DST = d;
-        O = o;
-        d = growOut(3 * (width - count) + 2);
-      }
-      while (count < width) {
-        d[o++] = C_COMMA;
-        d[o++] = DQ;
-        d[o++] = DQ;
-        count += 1;
-      }
-    } else if (count > width) {
-      pushLongErr(recLine, recRow, d, cutPos + 1, o);
-      o = cutPos;
-    }
-    d[o++] = C_RBRACKET;
-    anyRow = true;
-    rowCount += 1;
+    d[o++] = 125;
   }
-
-  if (mode === 0) o += d.write('[],"rows":[', o, 'latin1');
-  o += d.write('],"errors":[', o, 'latin1');
-  if (EO > 0) {
-    if (o + EO > d.length) {
-      DST = d;
-      O = o;
-      d = growOut(EO);
-    }
-    ERR.copy(d, o, 0, EO);
-    o += EO;
-    EO = 0;
-  }
-  d[o++] = C_RBRACKET;
-  d[o++] = C_RBRACE;
-  DST = d;
+  o = room(o, 2);
+  D[o++] = 93;
+  D[o++] = 125;
   O = o;
+  EC = 0;
+  XO = 0;
 }
 
 /**
- * The whole answers.json for the harness's cases.json, as bytes: a JSON array of {"columns","rows","errors"},
- * one per case in the cases' order. Each case's text is read where it sits, JSON-escaped, and never decoded.
+ * The fields of one record from i, each written as "...", separated by commas, at o (the caller has written the
+ * record's "["). Returns the count of fields, or -1 when the record runs past the window; hands back in T_*.
  */
-export function answersJson(src) {
-  DST = Buffer.allocUnsafe(src.length * 6 + 4096);
-  O = 0;
-  EO = 0;
-  DST[O++] = C_LBRACKET;
-  let from = 0;
-  let first = true;
+function recordFn(s, d, i, o, line, n, width) {
+  let count = 0;
+  let cutO = 0;
   for (;;) {
-    const at = src.indexOf(TEXT_KEY, from);
-    if (at < 0) break;
-    const textStart = at + 8;
-    const head = src.indexOf(HEADER_KEY, textStart);
-    if (head < 0) throw new Error('cases.json: a case text with no header after it');
-    if (!first) DST[O++] = C_COMMA;
-    first = false;
-    emitCase(src, textStart, head, src[head + 11] === C_T);
-    from = head + 11;
+    if (count > 0) d[o++] = 44;
+    d[o++] = 34;
+    const vs = o;
+    const quoted = s[i] === 92 && s[i + 1] === 34 && i + 6 <= n;
+    if (quoted) quotedFn(s, d, i, o, line, n);
+    else plainFn(s, d, i, o, line, n);
+    const ended = T_END;
+    if (ended === MORE) return -1;
+    i = T_I;
+    o = T_O;
+    line = T_LINE;
+    count += 1;
+    if (ended !== COMMA) {
+      T_BLANK = count === 1 && o === vs && !quoted;
+      d[o++] = 34;
+      if (count === width) cutO = o;
+      break;
+    }
+    d[o++] = 34;
+    if (count === width) cutO = o;
   }
-  DST[O++] = C_RBRACKET;
-  return DST.subarray(0, O);
+  T_I = i;
+  T_O = o;
+  T_LINE = line;
+  T_CUT = cutO;
+  return count;
 }
 
-// One tiny text per branch of the policy: a BOM and CRLF, a quoted field holding a comma and a doubled quote, a
-// line break inside quotes, junk after a closing quote, a stray CR to drop, a quote that never closes, blank
-// lines, a short row and a long row, an empty text, a BOM alone, characters outside Latin-1, a lone CR inside
-// quotes, and a quote inside the junk. run is pure, so both header readings of each are walked. The metric is
-// the CPU time of one process, so a branch first met inside already-compiled code costs a deoptimisation and a
-// recompilation; walking every branch once, on a constant that came from nowhere, lets the six real cases run
-// on settled code.
+/** The whole cases array from I, every case's answer written at O. */
+function scanAll() {
+  ensure(64);
+  if (S[I] !== 91) throw new NonCanonical();
+  I += 1;
+  O = put(O, bytes('['));
+  let first = true;
+  for (;;) {
+    if (!beginCase(first)) break;
+    first = false;
+    let s = S;
+    let d = D;
+    let n = N;
+    let i = I;
+    let o = O;
+    let line = 1;
+    let k = 0;
+    let width = -1;
+    let firstOff = -1;
+    let endOff = -1;
+    for (;;) {
+      if (n - i < LOW && !EOF) {
+        O = o;
+        refill(i, false);
+        s = S;
+        d = D;
+        n = N;
+        i = 0;
+      }
+      if (o > FLUSH_AT) {
+        o = flushOut(o);
+        d = D;
+      }
+      // Lines with no characters are no records: skip LF and CRLF.
+      let c = s[i];
+      while (c === 92) {
+        const e = s[i + 1];
+        if (e === 110) i += 2;
+        else if (e === 114 && s[i + 2] === 92 && s[i + 3] === 110) i += 4;
+        else break;
+        line += 1;
+        if (n - i < LOW && !EOF) {
+          O = o;
+          refill(i, false);
+          s = S;
+          d = D;
+          n = N;
+          i = 0;
+        }
+        c = s[i];
+      }
+      if (c === 34) {
+        if (i >= n) throw new NonCanonical();
+        break;
+      }
+      const recI = i;
+      const recO = o;
+      const recEC = EC;
+      const recXO = XO;
+      const recLine = line;
+      RL = line;
+      RK = k;
+      if (k === 0) o += 24;
+      else if (k > 1) d[o++] = 44;
+      d[o++] = 91;
+      const count = recordFn(s, d, i, o, line, n, width);
+      if (count < 0) {
+        // The record runs past the window: read it again from its start after a refill (or a larger window).
+        if (EOF) throw new NonCanonical();
+        o = recO;
+        EC = recEC;
+        XO = recXO;
+        line = recLine;
+        O = o;
+        refill(recI, recI === 0);
+        s = S;
+        d = D;
+        n = N;
+        i = 0;
+        continue;
+      }
+      i = T_I;
+      o = T_O;
+      line = T_LINE;
+      const cutO = T_CUT;
+      // A line left with no characters (only dropped CRs) is no record; its errors stay.
+      if (T_BLANK) {
+        o = recO;
+        continue;
+      }
+      if (width < 0) width = count;
+      if (k > 0) {
+        if (count < width) {
+          o = padShort(count, width, o);
+          d = D;
+        } else if (count > width) {
+          longRow(d, cutO + 1, o);
+          o = cutO;
+        }
+      }
+      d[o++] = 93;
+      if (k === 0) {
+        firstOff = FLUSHED + recO;
+        endOff = FLUSHED + o;
+        o += 9;
+      }
+      k += 1;
+    }
+    I = i;
+    O = o;
+    endCase(k, firstOff, endOff);
+  }
+}
+
+/** Reset the reader for one source (a file descriptor or a buffer) and one sink (a file descriptor or memory). */
+function open(srcFd, srcMem, window, outFd) {
+  SRC_FD = srcFd;
+  SRC_MEM = srcMem;
+  SRC_POS = 0;
+  setS(Buffer.allocUnsafe(window + 8));
+  LOW = Math.min(16384, window >> 2);
+  N = 0;
+  I = 0;
+  EOF = false;
+  OUT_FD = outFd;
+  FLUSHED = 0;
+  FLUSH_AT = outFd >= 0 ? Math.min(FLUSH, window) : 256;
+  setD(Buffer.allocUnsafe(FLUSH_AT + 3 * S.length + 4096));
+  O = 0;
+  EC = 0;
+  XO = 0;
+  refill(0, false);
+}
+
+/** The answers JSON for a cases JSON held in memory, as bytes. */
+function answerBuffer(src, window) {
+  open(-1, src, window, -1);
+  scanAll();
+  const out = D.subarray(0, O);
+  S = null;
+  D = null;
+  SV = null;
+  DV = null;
+  SRC_MEM = null;
+  return out;
+}
+
+/** cases.json re-spelled the one way the fast reader reads: JSON.stringify of {id, input: {text, header}}. */
+function canonical(text) {
+  const cases = JSON.parse(text);
+  const out = [];
+  for (const c of cases) out.push({ id: 'x', input: { text: String(c.input.text), header: c.input.header === true } });
+  return Buffer.from(JSON.stringify(out), 'utf8');
+}
+
+/**
+ * The harness's run: /input/cases.json to /output/answers.json. `window` (the input window's size) and `strict`
+ * (throw rather than fall back to the canonical spelling) are for tests only; the harness passes neither.
+ */
+export function main(inputDir, outputDir, window = WINDOW, strict = false) {
+  const inPath = join(inputDir, 'cases.json');
+  const outPath = join(outputDir, 'answers.json');
+  let inFd = -1;
+  let outFd = -1;
+  try {
+    inFd = openSync(inPath, 'r');
+    outFd = openSync(outPath, 'w');
+    open(inFd, null, window, outFd);
+    scanAll();
+    writeAll(D, 0, O);
+  } catch (e) {
+    if (strict) throw e;
+    // Not the plain layout (or anything unexpected): answer from the canonical spelling of the same cases.
+    if (inFd >= 0) closeSync(inFd);
+    if (outFd >= 0) closeSync(outFd);
+    inFd = -1;
+    outFd = -1;
+    const src = canonical(readFileSync(inPath, 'utf8'));
+    writeFileSync(outPath, answerBuffer(src, src.length + 64));
+  }
+  if (inFd >= 0) closeSync(inFd);
+  if (outFd >= 0) closeSync(outFd);
+  S = null;
+  D = null;
+  SV = null;
+  DV = null;
+}
+
+/**
+ * csv-reader 1.0.0's answer for one case's input {text, header}: {columns, rows, errors}. The same reader over a
+ * single case, returned as the JSON value.
+ */
+export function run(input) {
+  const text = String(input.text);
+  const header = input.header === true;
+  const one = Buffer.from(JSON.stringify([{ id: 'x', input: { text, header } }]), 'utf8');
+  return JSON.parse(answerBuffer(one, one.length + 64).toString('utf8'))[0];
+}
+
+// One tiny text per branch of the policy, read through a tiny window so the refill, the record restart and the
+// window growth run too. V8 compiles the hot loop for the branches it has seen; walking each one first keeps the
+// real input from meeting a branch the compiled code never planned for.
 const WARM_TEXTS = [
   '\uFEFFa,b,c\r\n1,2,3\r\n',
   '"x,y","a""b","c\r\nd"\r\n',
@@ -456,23 +815,15 @@ const WARM_TEXTS = [
   'é,東,"x\ry",\r\n',
   '"a"x"y,b\n',
   '\r\r\r\n,\n""\n',
+  'a\tb,\u0001,\\,\uD800,"q\u0002"\n' + 'long field '.repeat(12) + ',x\n',
 ];
 try {
   const warm = [];
-  for (let i = 0; i < WARM_TEXTS.length; i++) warm.push({ id: 'g-' + i, input: { text: WARM_TEXTS[i], header: i % 2 === 0 } });
-  const warmBuf = Buffer.from(JSON.stringify(warm), 'utf8');
-  for (let i = 0; i < 2; i++) answersJson(warmBuf);
+  for (let i = 0; i < WARM_TEXTS.length; i++) warm.push({ id: 'g', input: { text: WARM_TEXTS[i], header: i % 2 === 0 } });
+  for (let i = 0; i < WARM_TEXTS.length; i++) warm.push({ id: 'g', input: { text: WARM_TEXTS[i], header: i % 2 !== 0 } });
+  answerBuffer(Buffer.from(JSON.stringify(warm), 'utf8'), 48);
 } catch {
-  // a warm-up that somehow throws must never stop the entry: it can change nothing about the answers
+  // a warm-up that somehow throws must never stop the entry: it changes nothing about the answers
 }
-
-/**
- * csv-reader 1.0.0's answer for one case's input {text, header}: {columns, rows, errors}. The same reader as
- * answersJson, over a single case, returned as the JSON value.
- */
-export function run(input) {
-  const text = String(input.text);
-  const header = input.header === true;
-  const one = Buffer.from(JSON.stringify([{ id: 'x', input: { text, header } }]), 'utf8');
-  return JSON.parse(answersJson(one).toString('utf8'))[0];
-}
+EC = 0;
+XO = 0;
